@@ -372,9 +372,9 @@
     lastGood = Date.now();
     clipStarted = lastGood;
     vid.muted = !wantSound;
-    publish();
     vid.src = src;
     preloadNext();
+    publish();
     if (armTimer) clearTimeout(armTimer);
     armTimer = setTimeout(() => {
       armTimer = 0;
@@ -439,6 +439,8 @@
 
   function onTime() {
     if ((vid.getAttribute('src') || '') !== expectedSrc) return;
+    // A last timeupdate from a file that already failed must not cancel the skip.
+    if (vid.error) return;
     if (vid.currentTime > lastMediaTime + 0.2) {
       lastMediaTime = vid.currentTime;
       lastGood = Date.now();
@@ -633,9 +635,13 @@
     if (debug) paintDebug();
   }
 
-  addEventListener('offline', () => { offline = true; });
+  addEventListener('offline', () => {
+    offline = true;
+    publish();
+  });
   addEventListener('online', () => {
     offline = false;
+    publish();
     if (Date.now() - booted < 5000 || paused || !clips.length || reloading) return;
     if (vid.error || vid.networkState === 3) show(index);
     else if (expectedSrc && vid.paused) playClip();
