@@ -20,7 +20,8 @@
   const fresh = params.get('fresh') === '1';
   const debug = params.get('debug') === '1';
   const reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-  const leavesOn = params.get('leaves') !== '0' && !reduceMotion;
+  // Leaves are off unless the TV asks for them. The default page stays a plain video.
+  const leavesOn = params.get('leaves') === '1' && !reduceMotion;
   const LEAF_CAP = 12;
   const FAIL_LIMIT = 3;
   const FAILURE_BACKOFF_MS = 180000;
@@ -364,7 +365,6 @@
     index = ((n % clips.length) + clips.length) % clips.length;
     const src = clips[index];
     expectedSrc = src;
-    counter.style.opacity = '';
     counter.textContent = (index + 1) + ' / ' + clips.length;
     bar.style.width = '0%';
     lastMediaTime = -1;
@@ -387,7 +387,7 @@
   function showEmpty() {
     releaseVideo();
     counter.textContent = window.CLIPS ? 'No clips yet' : 'Playlist missing';
-    counter.style.opacity = '1';
+    stage.classList.add('empty');
     bar.style.width = '0%';
     publish();
   }
@@ -529,6 +529,7 @@
   function initLeaves() {
     if (!leavesOn || leaves.length) return;
     const fx = document.getElementById('fx');
+    fx.style.display = 'block';
     const colors = ['#e07a3d', '#e8c56b', '#f6edd8', '#c4552a', '#8c2f39', '#d4a04a'];
     const count = LEAF_CAP;
     for (let n = 0; n < count; n++) {
@@ -538,7 +539,7 @@
       el.style.width = w + 'px';
       el.style.height = Math.round(w * 1.45) + 'px';
       el.style.background = colors[n % colors.length];
-      el.style.opacity = String(0.28 + (n % 4) * 0.08);
+      el.style.opacity = '1';
       fx.appendChild(el);
       leaves.push({
         el: el,
@@ -663,7 +664,7 @@
   if (debug) {
     dbg = document.createElement('div');
     dbg.id = 'debug';
-    dbg.style.cssText = 'position:fixed;left:28px;bottom:28px;z-index:9;background:rgba(26,12,12,.82);color:#f6edd8;font:16px/1.4 monospace;padding:8px 10px;border-radius:6px;white-space:pre';
+    dbg.style.cssText = 'position:fixed;left:28px;bottom:28px;z-index:9;background:#1a0c0c;color:#f6edd8;font:16px/1.4 monospace;padding:8px 10px;border-radius:6px;white-space:pre';
     document.body.appendChild(dbg);
   }
 
