@@ -26,7 +26,7 @@ Right arrow or Space: next · Left arrow: previous · P: pause · M: sound on/of
 
 Clips start muted so Chrome and TV browsers allow autoplay. M, or the sound button, turns sound on. The clips in this set are silent.
 
-Move the pointer to see the controls and the clip count (`3 / 8`). The pointer hides again after a few seconds still. The Thanksgiving chip stays in the corner. It counts calendar days to Thursday, November 26, 2026 in America/New_York, the same clock as the other boards, and it refreshes once a minute so the day flips at midnight Eastern. The day before it reads `1 DAY UNTIL THANKSGIVING`. On November 26 it reads `HAPPY THANKSGIVING FROM 3R`. After that it reads `THANK YOU FOR A GREAT YEAR`. A light falling-leaves effect sits over the picture. `?leaves=0` turns the leaves off.
+Move the pointer to see the controls and the clip count (`3 / 8`). The pointer hides again after a few seconds still. The Thanksgiving chip stays in the corner and does not animate. It counts calendar days to Thursday, November 26, 2026 in America/New_York, the same clock as the other boards, and it refreshes once a minute so the day flips at midnight Eastern. The day before it reads `1 DAY UNTIL THANKSGIVING`. On November 26 it reads `HAPPY THANKSGIVING FROM 3R`. After that it reads `THANK YOU FOR A GREAT YEAR`. The picture sits on a plain black background. Falling leaves are off. `?leaves=1` turns them on.
 
 ## URL options
 
@@ -36,7 +36,7 @@ Move the pointer to see the controls and the clip count (`3 / 8`). The pointer h
 - `?shuffle=1` randomizes the order when the page loads.
 - `?slide=3` starts on that clip (1 is the first).
 - `?date=2026-11-26` previews the countdown for that calendar day. `?date=2026-11-27` previews the message after Thanksgiving.
-- `?leaves=0` turns the falling leaves off. Leaves are also hidden when the browser asks for reduced motion.
+- `?leaves=1` turns on a fixed set of falling leaves. They stay off otherwise, including when the browser asks for reduced motion.
 - `?fresh=1` loads a new page for every clip. Last resort for a TV that still leaks memory.
 - `?debug=1` shows the clip name, uptime, page loads, and the last problem.
 
@@ -54,7 +54,7 @@ Renaming a file does not change the order. The list does.
 
 When you replace a file and keep the same name, change the `?v=` text on that line (any new string). That is the cache buster, same idea as the Christmas board. Leave `?v=` alone when the bytes did not change, or the TV downloads the clip again for no reason. The `?v=` values shipped here are the first 10 characters of each file's SHA-256.
 
-`app.js` and `styles.css` are linked with `?v=20261027b`. Bump that text in `index.html` when you change those files so the TV does not keep an old copy. You do not need to touch it when you only edit `clips.js`.
+`app.js` and `styles.css` are linked with `?v=20261027c`. Bump that text in `index.html` when you change those files so the TV does not keep an old copy. You do not need to touch it when you only edit `clips.js`.
 
 ## Keeping the picture moving
 
@@ -62,13 +62,13 @@ One `<video>` element in the page is reused. Each clip is detached (`pause`, cle
 
 If `play()` is rejected, the board mutes and tries once more, then skips. Listeners and timers are registered once for the life of the page, not once per clip.
 
-The leaves are a fixed set of 12 shapes, created once. One animation frame loop moves them. That loop stops while the document is hidden. The screen wake lock is requested where the browser allows it, and requested again when the page becomes visible.
+Nothing translucent is painted over the video while it plays. The page background is black, the countdown chip is a static opaque label, and `#fade` is not shown. With `?leaves=1`, the leaves are a fixed set of 12 shapes, created once. One animation frame loop moves them, and that loop stops while the document is hidden. The screen wake lock is requested where the browser allows it, and requested again when the page becomes visible.
 
 After a scheduled reload the page resumes on the next clip, rather than jumping back to the first one. Saved resume state uses its own `tg_` keys so it does not collide with the Christmas board on the same `github.io` origin.
 
 ## Encoding
 
-Every shipped clip is the same shape: 1920×1080, 24 fps, 15.0 seconds, H.264 High profile level 4.1, about 1.5–3.6 Mbps, faststart, plus a silent AAC track. The set is about 32 MB. Desktop Chrome plays that.
+Every shipped clip is the same shape: 1920×1080, 24 fps, 15.0 seconds, H.264 Main profile level 4.0, about 2.2–2.7 Mbps, faststart, plus a silent AAC track. The set is about 35 MB. Desktop Chrome plays that.
 
 A lot of TVs only hardware-decode Baseline or Main. High profile with B-frames can stay black, which is what the Halloween board ran into. If this TV does that, re-encode on a computer, put the new file in place of the old one, change `?v=`, and push:
 
