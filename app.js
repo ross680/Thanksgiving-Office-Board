@@ -1,6 +1,8 @@
 (() => {
-  // Office TV board. One video element is reused. The playlist is clips.js.
-  // There is no GitHub API call. Clips play to the end, muted, so Chrome autoplay works.
+  // Office TV board, meant to sit on a screen for weeks.
+  // One <video> plays the playlist in clips.js. One off-document warmer preloads the
+  // next file and is aborted (src cleared, load()) before it is reused. Listeners,
+  // timers, and leaf nodes are created once. A stuck or broken clip is skipped.
   const params = new URLSearchParams(location.search);
 
   function num(key, fallback, min, max) {
@@ -13,13 +15,19 @@
   }
 
   const maxClip = num('maxclip', 60, 10, 600);
-  const stallSeconds = num('stall', 20, 5, 120);
-  const watchdogSeconds = num('watchdog', 90, 20, 600);
+  const stallMs = num('stall', 8, 1, 120) * 1000;
   const reloadHours = num('reload', 4, 0, 168);
   const fresh = params.get('fresh') === '1';
   const debug = params.get('debug') === '1';
-  const leavesOn = params.get('leaves') !== '0';
+  const reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const leavesOn = params.get('leaves') !== '0' && !reduceMotion;
+  const LEAF_CAP = 12;
+  const FAIL_LIMIT = 3;
+  const FAILURE_BACKOFF_MS = 180000;
+  const HARD_EXTRA_MS = 15 * 60 * 1000;
+  const HOUR_MS = 3600000;
 
+  const stage = document.getElementById('stage');
   const vid = document.getElementById('vid');
   const bar = document.querySelector('#progress span');
   const counter = document.getElementById('counter');
@@ -41,6 +49,7 @@
   vid.defaultMuted = true;
   vid.loop = false;
   vid.playsInline = true;
+  vid.preload = 'auto';
   try { vid.disablePictureInPicture = true; } catch (e) {}
   let wantSound = false;
 
@@ -70,28 +79,46 @@
   let paused = false;
   let failures = 0;
   let failedGen = -1;
+  let retryGen = -1;
   let reloading = false;
-  let reloadDue = false;
-  let timer = 0;
-  let stallTimer = 0;
+  let releasing = false;
+  let armed = false;
+  let offline = typeof navigator.onLine === 'boolean' ? navigator.onLine === false : false;
   let lastGood = Date.now();
   let lastMediaTime = -1;
   let sawFrame = false;
+  let clipStarted = 0;
   let wakeLock = null;
-  let preloadLink = null;
+  let lastWake = 0;
+  let preloader = null;
   let preloaded = '';
+  let armTimer = 0;
+  let failTimer = 0;
+  let idleTimer = 0;
+  let countdownTimer = 0;
+  let rafId = 0;
+  let lastFrame = 0;
+  const leaves = [];
   const booted = Date.now();
-  const reloadAt = reloadHours > 0 ? Date.now() + reloadHours * 3600 * 1000 : 0;
-  // Thursday, November 26, 2026. Fixed for this board; it does not roll to next year.
-  const THANKSGIVING = Date.UTC(2026, 10, 26);
+  const reloadAt = reloadHours > 0 ? booted + reloadHours * HOUR_MS : 0;
+  const hardAt = reloadAt ? reloadAt + HARD_EXTRA_MS : 0;
+
+  function clock() {
+    try {
+      if (typeof window.__nowMs === 'function') return window.__nowMs();
+    } catch (e) {}
+    return Date.now();
+  }
+
+  function nowDate() {
+    try {
+      if (typeof window.__now === 'function') return window.__now();
+    } catch (e) {}
+    return new Date();
+  }
 
   function note(msg) {
     store.set('tg_err', new Date().toLocaleTimeString() + ' ' + msg);
-  }
-
-  function clearTimer(id) {
-    if (id) clearTimeout(id);
-    return 0;
   }
 
   function labelOf(src) {
@@ -127,8 +154,11 @@
       const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(raw);
       if (match) return { y: Number(match[1]), m: Number(match[2]), d: Number(match[3]) };
     }
-    return nyParts(new Date());
+    return nyParts(nowDate());
   }
+
+  // Thursday, November 26, 2026. Fixed for this board; it does not roll to next year.
+  const THANKSGIVING = Date.UTC(2026, 10, 26);
 
   function daysUntilThanksgiving(parts) {
     const today = Date.UTC(parts.y, parts.m - 1, parts.d);
@@ -142,11 +172,26 @@
     return 'THANK YOU FOR A GREAT YEAR';
   }
 
+  let lastMessage = '';
   function paintCountdown() {
-    const days = daysUntilThanksgiving(activeParts());
-    countdown.textContent = countdownText(days);
+    const text = countdownText(daysUntilThanksgiving(activeParts()));
+    if (text !== lastMessage) {
+      lastMessage = text;
+      countdown.textContent = text;
+    }
+    window.__countdownChecks = (window.__countdownChecks || 0) + 1;
     publish();
   }
+
+  // Once a minute, just after the clock minute, so midnight America/New_York
+  // flips the chip on that tick instead of on a drifting multi-hour timer.
+  function scheduleCountdown() {
+    paintCountdown();
+    const delay = 60000 - (Date.now() % 60000) + 40;
+    countdownTimer = setTimeout(scheduleCountdown, delay);
+  }
+
+  window.__thanksgivingMessage = (date) => countdownText(daysUntilThanksgiving(nyParts(date)));
 
   function publish() {
     window.__board = {
@@ -156,151 +201,151 @@
       paused: paused,
       days: daysUntilThanksgiving(activeParts()),
       message: countdown.textContent,
-      leaves: leavesOn && document.querySelectorAll('.leaf').length
+      leaves: leaves.length,
+      failures: failures,
+      preload: preloaded,
+      offline: offline,
+      videos: document.querySelectorAll('video').length
     };
   }
 
-  // One playback element. The next file is warmed with a preload link, not a second <video>.
+  function warmer() {
+    if (preloader) return preloader;
+    preloader = document.createElement('video');
+    preloader.muted = true;
+    preloader.defaultMuted = true;
+    preloader.playsInline = true;
+    preloader.preload = 'auto';
+    preloader.setAttribute('aria-hidden', 'true');
+    try { preloader.disablePictureInPicture = true; } catch (e) {}
+    // Swallow preload errors. The playback element decides if a file is bad.
+    preloader.addEventListener('error', () => {});
+    return preloader;
+  }
+
+  function abortPreload() {
+    preloaded = '';
+    if (!preloader) return;
+    try { preloader.pause(); } catch (e) {}
+    preloader.removeAttribute('src');
+    preloader.src = '';
+    try { preloader.load(); } catch (e) {}
+  }
+
   function preloadNext() {
-    if (clips.length < 2) return;
+    if (clips.length < 2) {
+      abortPreload();
+      return;
+    }
     const next = clips[(index + 1) % clips.length];
     if (!next || next === preloaded) return;
+    abortPreload();
     preloaded = next;
-    if (preloadLink && preloadLink.parentNode) preloadLink.parentNode.removeChild(preloadLink);
-    preloadLink = document.createElement('link');
-    preloadLink.rel = 'preload';
-    preloadLink.as = 'video';
-    preloadLink.href = next;
-    document.head.appendChild(preloadLink);
+    warmer().src = next;
   }
 
   function releaseVideo() {
-    // Detach the decoder before the next clip. expectedSrc is cleared first so
-    // the error some TVs fire when src is removed does not count as a bad file.
+    releasing = true;
+    armed = false;
+    abortPreload();
     expectedSrc = '';
-    vid.onended = null;
-    vid.onerror = null;
-    vid.onplaying = null;
     try { vid.pause(); } catch (e) {}
     vid.classList.remove('on');
     vid.removeAttribute('src');
     try { vid.load(); } catch (e) {}
+    releasing = false;
   }
 
-  function armStall(gen) {
-    stallTimer = clearTimer(stallTimer);
-    stallTimer = setTimeout(() => {
-      if (gen !== generation || paused) return;
-      recover('stalled ' + labelOf(clips[index]));
-    }, stallSeconds * 1000);
-  }
-
-  function armMax(gen) {
-    timer = clearTimer(timer);
-    timer = setTimeout(() => {
-      if (gen !== generation || paused) return;
-      advance(gen);
-    }, maxClip * 1000);
-  }
-
-  function playClip(gen) {
+  function playClip() {
+    const gen = generation;
     let ret;
     try { ret = vid.play(); } catch (e) { ret = Promise.reject(e); }
-    // Older TV browsers return undefined from play(). Calling .then on that
-    // throws, and a throw here used to reload the Halloween board in a loop.
+    // Older TV browsers return undefined from play(). Calling .then on that throws.
     Promise.resolve(ret).then(() => {
       if (gen !== generation) return;
-      // Pause can land while play() is still resolving. Leave it paused.
       if (paused) {
         try { vid.pause(); } catch (e) {}
         return;
       }
       vid.classList.add('on');
       lastGood = Date.now();
-      preloadNext();
     }).catch((err) => {
-      if (gen !== generation || paused) return;
-      // Switching clips or pausing aborts the in-flight play(). That is not a bad file.
+      if (gen !== generation || paused || reloading) return;
       if (err && err.name === 'AbortError') return;
-      if (!vid.muted) {
+      // One muted retry per clip. Audible autoplay is what TV browsers reject.
+      if (retryGen !== gen) {
+        retryGen = gen;
         vid.muted = true;
         wantSound = false;
         soundBtn.textContent = '\uD83D\uDD07';
         soundBtn.setAttribute('aria-label', 'Turn sound on');
-        playClip(gen);
+        playClip();
         return;
       }
-      recover('playback rejected ' + labelOf(clips[index]));
+      failClip('playback rejected');
     });
   }
 
-  function failureReason(reason) {
-    return reason.indexOf('watchdog') === 0
-      || reason.indexOf('stalled') === 0
-      || reason.indexOf('could not') === 0
-      || reason.indexOf('playback rejected') === 0
-      || reason.indexOf('no frames') === 0
-      || reason.indexOf('no progress') !== -1;
-  }
-
-  function safeReload(reason) {
+  function safeReload(reason, nextIndex) {
     if (reloading) return;
-    note(reason);
+    const failureReload = reason === 'failures';
+    if (failureReload && offline) return;
     const last = Number(store.get('tg_reload_at')) || 0;
     // A clip that kills the page must not reboot the TV every few seconds.
-    if (failureReason(reason) && Date.now() - last < 180000) {
-      timer = clearTimer(timer);
-      stallTimer = clearTimer(stallTimer);
+    if (failureReload && Date.now() - last < FAILURE_BACKOFF_MS) {
       failures = 0;
-      timer = setTimeout(() => {
-        timer = 0;
-        if (!reloading) show(0);
-      }, 60000);
+      goTo(index + 1);
       return;
     }
     reloading = true;
+    note(reason);
     store.set('tg_reload_at', String(Date.now()));
     store.set('tg_reason', reason);
-    if (clips.length) store.set('tg_next', String((index + 1) % clips.length));
-    location.reload();
+    if (clips.length) {
+      const next = nextIndex == null ? (index + 1) % clips.length : nextIndex;
+      store.set('tg_next', String(next));
+    }
+    const url = new URL(location.href);
+    url.searchParams.set('bust', String(Date.now()));
+    location.replace(url.toString());
   }
 
-  function recover(reason) {
+  function failClip(reason) {
+    if (reloading || releasing) return;
     const gen = generation;
-    if (failedGen === gen || reloading) return;
+    if (failedGen === gen) return;
     failedGen = gen;
     note(reason);
-    setTimeout(() => {
+    failures += 1;
+    const snapshot = failures;
+    if (failTimer) clearTimeout(failTimer);
+    // Leave the current call stack. error/abort can fire inside show().
+    failTimer = setTimeout(() => {
+      failTimer = 0;
       if (generation !== gen || reloading) return;
-      if (reloadDue) {
-        safeReload('scheduled');
+      if (failures < snapshot) return;
+      if (failures >= FAIL_LIMIT && !offline) {
+        safeReload('failures');
         return;
       }
-      failures += 1;
-      if (!clips.length) return;
-      if (failures >= clips.length) {
-        failures = 0;
-        safeReload('watchdog ' + reason);
-        return;
-      }
+      if (failures >= FAIL_LIMIT && offline) failures = 0;
       goTo(index + 1);
     }, 0);
   }
 
   function goTo(n) {
+    if (reloading) return;
     if (fresh && clips.length > 1) {
       const next = ((n % clips.length) + clips.length) % clips.length;
-      store.set('tg_next', String(next));
-      location.reload();
+      safeReload('fresh', next);
       return;
     }
     show(n);
   }
 
-  function advance(gen, manual) {
-    if (gen != null && gen !== generation) return;
+  function advance(manual) {
     if (!clips.length || reloading) return;
-    if (!manual && reloadDue) {
+    if (!manual && reloadAt && clock() >= reloadAt) {
       safeReload('scheduled');
       return;
     }
@@ -312,9 +357,9 @@
       showEmpty();
       return;
     }
+    if (reloading) return;
     const gen = ++generation;
-    timer = clearTimer(timer);
-    stallTimer = clearTimer(stallTimer);
+    armed = false;
     releaseVideo();
     index = ((n % clips.length) + clips.length) % clips.length;
     const src = clips[index];
@@ -324,44 +369,100 @@
     bar.style.width = '0%';
     lastMediaTime = -1;
     sawFrame = false;
+    lastGood = Date.now();
+    clipStarted = lastGood;
     vid.muted = !wantSound;
     publish();
-    preloadNext();
-
-    vid.onended = () => {
-      if (generation !== gen) return;
-      if ((vid.getAttribute('src') || '') !== expectedSrc) return;
-      failures = 0;
-      lastGood = Date.now();
-      advance(gen);
-    };
-    vid.onerror = () => {
-      const current = vid.getAttribute('src') || '';
-      if (!current || current !== expectedSrc || generation !== gen) return;
-      recover('could not load ' + labelOf(current));
-    };
-    vid.onplaying = () => {
-      if (generation !== gen) return;
-      vid.classList.add('on');
-      lastGood = Date.now();
-      preloadNext();
-    };
     vid.src = src;
+    preloadNext();
+    if (armTimer) clearTimeout(armTimer);
+    armTimer = setTimeout(() => {
+      armTimer = 0;
+      if (generation === gen) armed = true;
+    }, 0);
     if (paused) return;
-    playClip(gen);
-    armMax(gen);
-    armStall(gen);
+    playClip();
   }
 
   function showEmpty() {
-    timer = clearTimer(timer);
-    stallTimer = clearTimer(stallTimer);
     releaseVideo();
     counter.textContent = window.CLIPS ? 'No clips yet' : 'Playlist missing';
     counter.style.opacity = '1';
     bar.style.width = '0%';
     publish();
   }
+
+  function onEnded() {
+    if (!armed || reloading || releasing || swapGrace()) return;
+    if ((vid.getAttribute('src') || '') !== expectedSrc) return;
+    failures = 0;
+    failedGen = -1;
+    lastGood = Date.now();
+    advance(false);
+  }
+
+  function onError() {
+    if (releasing || reloading) return;
+    const current = vid.getAttribute('src') || '';
+    if (!current || current !== expectedSrc) return;
+    failClip('error');
+  }
+
+  // load() queues abort/emptied. Ignore that burst so a healthy cut is not a failure.
+  function swapGrace() {
+    return clipStarted > 0 && Date.now() - clipStarted < 400;
+  }
+
+  function onAbort() {
+    if (!armed || releasing || reloading || paused || swapGrace()) return;
+    if ((vid.getAttribute('src') || '') !== expectedSrc) return;
+    failClip('abort');
+  }
+
+  function onEmptied() {
+    if (!armed || releasing || reloading || paused || swapGrace()) return;
+    if ((vid.getAttribute('src') || '') !== expectedSrc) return;
+    failClip('emptied');
+  }
+
+  function onStalled() {
+    if (!armed || releasing || reloading || paused || document.hidden) return;
+    if ((vid.getAttribute('src') || '') !== expectedSrc) return;
+    if (Date.now() - lastGood >= stallMs) failClip('stalled');
+  }
+
+  function onPlaying() {
+    if ((vid.getAttribute('src') || '') !== expectedSrc) return;
+    vid.classList.add('on');
+    lastGood = Date.now();
+  }
+
+  function onTime() {
+    if ((vid.getAttribute('src') || '') !== expectedSrc) return;
+    if (vid.currentTime > lastMediaTime + 0.2) {
+      lastMediaTime = vid.currentTime;
+      lastGood = Date.now();
+      if (vid.videoWidth > 0) {
+        sawFrame = true;
+        failures = 0;
+        failedGen = -1;
+        if (failTimer) {
+          clearTimeout(failTimer);
+          failTimer = 0;
+        }
+      } else if (vid.currentTime > 1) {
+        failClip('no frames');
+      }
+    }
+  }
+
+  vid.addEventListener('ended', onEnded);
+  vid.addEventListener('error', onError);
+  vid.addEventListener('abort', onAbort);
+  vid.addEventListener('emptied', onEmptied);
+  vid.addEventListener('stalled', onStalled);
+  vid.addEventListener('playing', onPlaying);
+  vid.addEventListener('timeupdate', onTime);
 
   function togglePause() {
     paused = !paused;
@@ -370,15 +471,12 @@
     publish();
     if (!clips.length) return;
     if (paused) {
-      timer = clearTimer(timer);
-      stallTimer = clearTimer(stallTimer);
       try { vid.pause(); } catch (e) {}
-      if (reloadDue) safeReload('scheduled');
+      if (reloadAt && clock() >= reloadAt) safeReload('scheduled');
       return;
     }
-    playClip(generation);
-    armMax(generation);
-    armStall(generation);
+    lastGood = Date.now();
+    playClip();
   }
 
   function toggleSound() {
@@ -386,10 +484,10 @@
     vid.muted = !wantSound;
     soundBtn.textContent = vid.muted ? '\uD83D\uDD07' : '\uD83D\uDD0A';
     soundBtn.setAttribute('aria-label', vid.muted ? 'Turn sound on' : 'Turn sound off');
-    if (wantSound && !paused && clips.length) playClip(generation);
+    if (wantSound && !paused && clips.length) playClip();
   }
 
-  document.getElementById('next').onclick = () => advance(generation, true);
+  document.getElementById('next').onclick = () => advance(true);
   document.getElementById('prev').onclick = () => show(index - 1);
   pauseBtn.onclick = togglePause;
   soundBtn.onclick = (e) => {
@@ -406,7 +504,7 @@
     const key = (e.key || '').toLowerCase();
     if (key === 'arrowright' || key === ' ') {
       e.preventDefault();
-      advance(generation, true);
+      advance(true);
     } else if (key === 'arrowleft') {
       e.preventDefault();
       show(index - 1);
@@ -415,25 +513,76 @@
     else if (key === 'f') document.getElementById('full').click();
   });
 
-  function leaves() {
-    if (!leavesOn) return;
+  function wakeCursor() {
+    stage.classList.add('awake');
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      idleTimer = 0;
+      stage.classList.remove('awake');
+    }, 3000);
+  }
+  stage.addEventListener('mousemove', wakeCursor);
+  stage.addEventListener('pointerdown', wakeCursor);
+
+  function initLeaves() {
+    if (!leavesOn || leaves.length) return;
     const fx = document.getElementById('fx');
     const colors = ['#e07a3d', '#e8c56b', '#f6edd8', '#c4552a', '#8c2f39', '#d4a04a'];
-    const motions = ['leafA', 'leafB', 'leafC'];
-    for (let n = 0; n < 12; n++) {
+    const count = LEAF_CAP;
+    for (let n = 0; n < count; n++) {
       const el = document.createElement('span');
       el.className = 'leaf';
-      el.style.left = ((n * 8.3) % 100) + '%';
-      el.style.animationName = motions[n % 3];
-      el.style.animationDuration = (18 + (n % 7) * 2) + 's';
-      el.style.animationDelay = (-n * 1.4) + 's';
-      el.style.opacity = String(0.28 + (n % 4) * 0.08);
-      el.style.background = colors[n % colors.length];
       const w = 7 + (n % 3) * 3;
       el.style.width = w + 'px';
       el.style.height = Math.round(w * 1.45) + 'px';
+      el.style.background = colors[n % colors.length];
+      el.style.opacity = String(0.28 + (n % 4) * 0.08);
       fx.appendChild(el);
+      leaves.push({
+        el: el,
+        x: (n * 8.3) % 100,
+        y: (n * 17) % 110,
+        speed: 6 + (n % 5) * 1.4,
+        drift: (n % 2 ? 1 : -1) * (1.2 + (n % 4) * 0.4),
+        rot: n * 28,
+        spin: (n % 2 ? 1 : -1) * (18 + (n % 5) * 6)
+      });
     }
+  }
+
+  function leafFrame(ts) {
+    rafId = 0;
+    if (document.hidden || leaves.length === 0) return;
+    const dt = lastFrame ? Math.min(0.05, (ts - lastFrame) / 1000) : 0.016;
+    lastFrame = ts;
+    const count = leaves.length;
+    for (let i = 0; i < count; i++) {
+      const p = leaves[i];
+      p.y += p.speed * dt;
+      p.x += p.drift * dt;
+      p.rot += p.spin * dt;
+      if (p.y > 108) {
+        p.y = -12;
+        p.x = (i * 8.3 + p.y) % 100;
+      }
+      if (p.x < -8) p.x = 104;
+      else if (p.x > 108) p.x = -4;
+      p.el.style.transform = 'translate3d(' + p.x + 'vw,' + p.y + 'vh,0) rotate(' + p.rot + 'deg)';
+    }
+    rafId = requestAnimationFrame(leafFrame);
+  }
+
+  function startLeaves() {
+    if (rafId || document.hidden || leaves.length === 0) return;
+    lastFrame = 0;
+    rafId = requestAnimationFrame(leafFrame);
+  }
+
+  function stopLeaves() {
+    if (!rafId) return;
+    cancelAnimationFrame(rafId);
+    rafId = 0;
+    lastFrame = 0;
   }
 
   async function wake() {
@@ -445,74 +594,71 @@
   }
 
   function onVisible() {
-    if (document.hidden) return;
-    wake();
-    if (!paused && expectedSrc && vid.paused && !reloading) playClip(generation);
-  }
-
-  // Tick once a minute instead of one multi-hour timeout. Some TV browsers drop long timers.
-  function watchReload() {
-    if (reloadAt && !reloadDue && Date.now() >= reloadAt) {
-      reloadDue = true;
-      if (paused || !clips.length) safeReload('scheduled');
+    if (document.hidden) {
+      stopLeaves();
+      lastGood = Date.now();
+      return;
     }
-    setTimeout(watchReload, 60 * 1000);
+    startLeaves();
+    wake();
+    if (!paused && expectedSrc && vid.paused && !reloading) playClip();
   }
 
+  function tick() {
+    if (reloading) return;
+    if (hardAt && clock() >= hardAt) {
+      safeReload('hard');
+      return;
+    }
+    if (reloadAt && clock() >= reloadAt && (paused || !clips.length)) {
+      safeReload('scheduled');
+      return;
+    }
+    const now = Date.now();
+    if (paused || !clips.length || document.hidden) {
+      lastGood = now;
+    } else if (expectedSrc) {
+      const duration = vid.duration;
+      if (duration && isFinite(duration) && duration > 0) {
+        bar.style.width = Math.min(100, (100 * vid.currentTime) / duration) + '%';
+      }
+      if (!sawFrame && vid.currentTime > 1 && vid.videoWidth === 0) failClip('no frames');
+      else if (now - lastGood >= stallMs) failClip('stalled');
+      else if (clipStarted && now - clipStarted >= maxClip * 1000) advance(false);
+    }
+    if (now - lastWake >= 60000) {
+      lastWake = now;
+      wake();
+    }
+    if (debug) paintDebug();
+  }
+
+  addEventListener('offline', () => { offline = true; });
   addEventListener('online', () => {
+    offline = false;
     if (Date.now() - booted < 5000 || paused || !clips.length || reloading) return;
     if (vid.error || vid.networkState === 3) show(index);
+    else if (expectedSrc && vid.paused) playClip();
   });
 
-  // Log script errors. Reloading here caused a reboot loop when play() threw.
   window.onerror = (msg) => { note('error: ' + msg); };
 
-  setInterval(() => {
-    if (reloading) return;
-    if (paused || !clips.length || document.hidden) {
-      lastGood = Date.now();
-      return;
-    }
-    const duration = vid.duration;
-    if (duration && isFinite(duration) && duration > 0) {
-      bar.style.width = Math.min(100, (100 * vid.currentTime) / duration) + '%';
-    }
-    if (vid.currentTime > lastMediaTime + 0.2) {
-      lastMediaTime = vid.currentTime;
-      lastGood = Date.now();
-      failures = 0;
-      armStall(generation);
-      // Time can move while the decoder paints nothing. A black picture is a bad clip.
-      if (!sawFrame && vid.currentTime > 1) {
-        if (vid.videoWidth > 0) sawFrame = true;
-        else recover('no frames ' + labelOf(clips[index]));
-      }
-    }
-  }, 250);
-
-  setInterval(() => {
-    if (paused || !clips.length || document.hidden || reloading) {
-      lastGood = Date.now();
-      return;
-    }
-    if (Date.now() - lastGood > watchdogSeconds * 1000) {
-      lastGood = Date.now();
-      recover('no progress');
-    }
-  }, 5000);
+  let dbg = null;
+  function paintDebug() {
+    if (!dbg) return;
+    const up = Math.round((Date.now() - Number(store.get('tg_since'))) / 60000);
+    dbg.textContent = 'clip: ' + (clips.length ? (index + 1) + '/' + clips.length + '  ' + labelOf(clips[index]) : 'none')
+      + '\nrunning: ' + up + ' min'
+      + '\npage loads: ' + store.get('tg_loads')
+      + '\nfailures: ' + failures
+      + '\nlast problem: ' + (store.get('tg_err') || 'none');
+  }
 
   if (debug) {
-    const dbg = document.createElement('div');
+    dbg = document.createElement('div');
     dbg.id = 'debug';
     dbg.style.cssText = 'position:fixed;left:28px;bottom:28px;z-index:9;background:rgba(26,12,12,.82);color:#f6edd8;font:16px/1.4 monospace;padding:8px 10px;border-radius:6px;white-space:pre';
     document.body.appendChild(dbg);
-    setInterval(() => {
-      const up = Math.round((Date.now() - Number(store.get('tg_since'))) / 60000);
-      dbg.textContent = 'clip: ' + (clips.length ? (index + 1) + '/' + clips.length + '  ' + labelOf(clips[index]) : 'none')
-        + '\nrunning: ' + up + ' min'
-        + '\npage loads: ' + store.get('tg_loads')
-        + '\nlast problem: ' + (store.get('tg_err') || 'none');
-    }, 1000);
   }
 
   function startIndex() {
@@ -529,13 +675,12 @@
     return 0;
   }
 
-  leaves();
-  paintCountdown();
-  setInterval(paintCountdown, 60 * 1000);
+  initLeaves();
+  startLeaves();
+  scheduleCountdown();
   wake();
   document.addEventListener('visibilitychange', onVisible);
-  setInterval(wake, 60000);
-  watchReload();
+  setInterval(tick, 500);
 
   if (!clips.length) showEmpty();
   else show(startIndex());
