@@ -1,0 +1,29 @@
+:root{--gold:#e8c56b;--cream:#f6edd8;--orange:#e07a3d;--bg:#2a1210}
+*{box-sizing:border-box}
+html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#000;color-scheme:dark}
+body{font-family:Arial,Helvetica,sans-serif;color:var(--cream)}
+#stage{position:fixed;inset:0;cursor:none;background:
+  radial-gradient(ellipse at 18% 100%, rgba(110,36,48,.72), transparent 52%),
+  radial-gradient(ellipse at 88% 8%, rgba(224,122,61,.28), transparent 46%),
+  linear-gradient(180deg, #3d1816, #1a0c0c)}
+#vid{position:absolute;inset:0;z-index:2;width:100%;height:100%;object-fit:contain;background:#000;opacity:0;transition:opacity .6s ease;user-select:none;-webkit-user-drag:none}
+#vid.on{opacity:1}
+#fx{position:absolute;inset:0;z-index:3;pointer-events:none;overflow:hidden}
+.leaf{position:absolute;top:0;left:0;display:block;border-radius:2px 80% 2px 80%;pointer-events:none}
+#fade{position:absolute;inset:0;z-index:4;pointer-events:none;background:linear-gradient(to bottom,rgba(26,12,12,.16),transparent 15%,transparent 84%,rgba(26,12,12,.28))}
+#progress{position:absolute;left:0;right:0;bottom:0;z-index:5;height:5px;background:rgba(246,237,216,.1)}
+#progress span{display:block;width:0;height:100%;background:var(--gold);box-shadow:0 0 10px var(--orange)}
+#countdown{position:absolute;left:28px;top:22px;z-index:5;padding:14px 20px;border:1px solid rgba(232,197,107,.8);border-radius:8px;background:rgba(42,18,16,.78);box-shadow:inset 4px 0 0 var(--orange);color:var(--cream);font-size:36px;font-weight:800;letter-spacing:.06em;text-transform:uppercase;white-space:nowrap;pointer-events:none}
+#counter{position:absolute;right:18px;top:14px;z-index:5;padding:7px 10px;border:1px solid rgba(232,197,107,.55);border-radius:7px;background:rgba(26,12,12,.62);color:var(--gold);font-size:13px;font-weight:700;letter-spacing:.08em;opacity:0;transition:opacity .2s}
+#controls{position:absolute;left:50%;bottom:24px;z-index:5;transform:translateX(-50%);display:flex;gap:8px;opacity:0;transition:opacity .2s}
+#controls button{width:44px;height:38px;border-radius:8px;border:1px solid rgba(232,197,107,.65);background:rgba(26,12,12,.78);color:var(--cream);font-size:17px;cursor:pointer}
+#stage.awake{cursor:default}
+#stage.awake #controls,#stage.awake #counter{opacity:1}
+@media (max-width:700px){
+  #countdown{font-size:16px;padding:8px 10px;left:12px;top:12px}
+  #controls{bottom:14px}
+  #controls button{width:40px;height:36px}
+}
+@media (prefers-reduced-motion: reduce){
+  .leaf{display:none}
+}
