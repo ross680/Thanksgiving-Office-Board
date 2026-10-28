@@ -128,79 +128,164 @@
     return parts[parts.length - 1] || src || 'clip';
   }
 
-  function nyParts(date) {
-    try {
-      const fmt = new Intl.DateTimeFormat('en-US', {
-        timeZone: 'America/New_York',
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit'
-      });
-      const bits = fmt.formatToParts(date);
-      const grab = (type) => {
-        for (let n = 0; n < bits.length; n++) {
-          if (bits[n].type === type) return Number(bits[n].value);
-        }
-        return 0;
-      };
-      return { y: grab('year'), m: grab('month'), d: grab('day') };
-    } catch (e) {
-      return { y: date.getFullYear(), m: date.getMonth() + 1, d: date.getDate() };
-    }
+  // Thursday, November 26, 2026, 12:00 AM America/New_York.
+  // Fixed for this board. After that day it does not roll to next year.
+  const TZ = 'America/New_York';
+  const TG_Y = 2026;
+  const TG_M = 11;
+  const TG_D = 26;
+
+  function easternOffsetMs(utcMs) {
+    // Used only if Intl has no timezone data. US Eastern rules since 2007.
+    const est = new Date(utcMs - 5 * 3600000);
+    const y = est.getUTCFullYear();
+    const march1Dow = new Date(Date.UTC(y, 2, 1)).getUTCDay();
+    const secondSunday = 1 + ((7 - march1Dow) % 7) + 7;
+    const dstStart = Date.UTC(y, 2, secondSunday, 7, 0, 0);
+    const nov1Dow = new Date(Date.UTC(y, 10, 1)).getUTCDay();
+    const firstSunday = 1 + ((7 - nov1Dow) % 7);
+    const dstEnd = Date.UTC(y, 10, firstSunday, 6, 0, 0);
+    return utcMs >= dstStart && utcMs < dstEnd ? -4 * 3600000 : -5 * 3600000;
   }
 
-  function activeParts() {
+  let tzFmt = null;
+  function tzParts(date) {
+    try {
+      if (!tzFmt) {
+        tzFmt = new Intl.DateTimeFormat('en-US', {
+          timeZone: TZ,
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit',
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+          hourCycle: 'h23'
+        });
+      }
+      const bits = tzFmt.formatToParts(date);
+      const grab = (type) => {
+        for (let n = 0; n < bits.length; n++) {
+          if (bits[n].type === type) return bits[n].value;
+        }
+        return '';
+      };
+      let h = Number(grab('hour'));
+      if (h === 24) h = 0;
+      const y = Number(grab('year'));
+      const m = Number(grab('month'));
+      const d = Number(grab('day'));
+      if (y && m && d) {
+        return { y: y, m: m, d: d, h: h, min: Number(grab('minute')), s: Number(grab('second')) };
+      }
+    } catch (e) {}
+    const off = easternOffsetMs(date.getTime());
+    const wall = new Date(date.getTime() + off);
+    return {
+      y: wall.getUTCFullYear(),
+      m: wall.getUTCMonth() + 1,
+      d: wall.getUTCDate(),
+      h: wall.getUTCHours(),
+      min: wall.getUTCMinutes(),
+      s: wall.getUTCSeconds()
+    };
+  }
+
+  function tzOffsetMs(utcMs) {
+    const p = tzParts(new Date(utcMs));
+    return Date.UTC(p.y, p.m - 1, p.d, p.h, p.min, p.s) - utcMs;
+  }
+
+  // UTC instant of a wall-clock time in America/New_York.
+  function easternWallUtc(y, m, d, h, min, s) {
+    const localAsUtc = Date.UTC(y, m - 1, d, h, min, s);
+    let off = tzOffsetMs(localAsUtc);
+    let utc = localAsUtc - off;
+    const off2 = tzOffsetMs(utc);
+    if (off2 !== off) utc = localAsUtc - off2;
+    return utc;
+  }
+
+  const THANKSGIVING_UTC = easternWallUtc(TG_Y, TG_M, TG_D, 0, 0, 0);
+
+  function pad2(n) {
+    return (n < 10 ? '0' : '') + n;
+  }
+
+  function calendarDaysUntil(date) {
+    const p = tzParts(date);
+    const today = Date.UTC(p.y, p.m - 1, p.d);
+    return Math.round((Date.UTC(TG_Y, TG_M - 1, TG_D) - today) / 86400000);
+  }
+
+  function countdownInstant() {
+    const now = nowDate();
     const raw = params.get('date');
     if (raw) {
       const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(raw);
-      if (match) return { y: Number(match[1]), m: Number(match[2]), d: Number(match[3]) };
+      if (match) {
+        const y = Number(match[1]);
+        const m = Number(match[2]);
+        const d = Number(match[3]);
+        if (m >= 1 && m <= 12 && d >= 1 && d <= 31) {
+          const wall = tzParts(now);
+          return new Date(easternWallUtc(y, m, d, wall.h, wall.min, wall.s));
+        }
+      }
     }
-    return nyParts(nowDate());
+    return now;
   }
 
-  // Thursday, November 26, 2026. Fixed for this board; it does not roll to next year.
-  const THANKSGIVING = Date.UTC(2026, 10, 26);
-
-  function daysUntilThanksgiving(parts) {
-    const today = Date.UTC(parts.y, parts.m - 1, parts.d);
-    return Math.round((THANKSGIVING - today) / 86400000);
+  function messageFor(date) {
+    const remain = THANKSGIVING_UTC - date.getTime();
+    if (!(remain > 0)) {
+      if (calendarDaysUntil(date) === 0) return 'Happy Thanksgiving from the 3R family';
+      return 'THANK YOU FOR A GREAT YEAR';
+    }
+    const total = Math.floor(remain / 1000);
+    const days = Math.floor(total / 86400);
+    const hours = Math.floor((total % 86400) / 3600);
+    const mins = Math.floor((total % 3600) / 60);
+    const secs = total % 60;
+    return days + 'd ' + pad2(hours) + 'h ' + pad2(mins) + 'm ' + pad2(secs) + 's until Thanksgiving';
   }
 
-  function countdownText(days) {
-    if (days > 1) return days + ' DAYS UNTIL THANKSGIVING';
-    if (days === 1) return '1 DAY UNTIL THANKSGIVING';
-    if (days === 0) return 'HAPPY THANKSGIVING FROM 3R';
-    return 'THANK YOU FOR A GREAT YEAR';
+  function daysField(date) {
+    const remain = THANKSGIVING_UTC - date.getTime();
+    if (remain > 0) return Math.floor(remain / 86400000);
+    return calendarDaysUntil(date);
   }
 
   let lastMessage = '';
   function paintCountdown() {
-    const text = countdownText(daysUntilThanksgiving(activeParts()));
+    const instant = countdownInstant();
+    const text = messageFor(instant);
     if (text !== lastMessage) {
       lastMessage = text;
       countdown.textContent = text;
     }
     window.__countdownChecks = (window.__countdownChecks || 0) + 1;
-    publish();
+    publish(instant);
   }
 
-  // Once a minute, just after the clock minute, so midnight America/New_York
-  // flips the chip on that tick instead of on a drifting multi-hour timer.
-  function scheduleCountdown() {
+  // One interval for the life of the page. The text comes from the clock,
+  // so a scheduled reload just starts this again and the chip does not drift.
+  function startCountdown() {
     paintCountdown();
-    const delay = 60000 - (Date.now() % 60000) + 40;
-    countdownTimer = setTimeout(scheduleCountdown, delay);
+    if (countdownTimer) return;
+    countdownTimer = setInterval(paintCountdown, 1000);
   }
 
-  window.__thanksgivingMessage = (date) => countdownText(daysUntilThanksgiving(nyParts(date)));
+  window.__thanksgivingMessage = (date) => messageFor(date);
 
-  function publish() {
+  function publish(instant) {
+    const when = instant || countdownInstant();
     window.__board = {
       index: index,
       count: clips.length,
       src: clips.length ? clips[index] : '',
       paused: paused,
-      days: daysUntilThanksgiving(activeParts()),
+      days: daysField(when),
       message: countdown.textContent,
       leaves: leaves.length,
       failures: failures,
@@ -604,6 +689,7 @@
     }
     startLeaves();
     wake();
+    paintCountdown();
     if (!paused && expectedSrc && vid.paused && !reloading) playClip();
   }
 
@@ -684,7 +770,7 @@
 
   initLeaves();
   startLeaves();
-  scheduleCountdown();
+  startCountdown();
   wake();
   document.addEventListener('visibilitychange', onVisible);
   setInterval(tick, 500);
