@@ -3,6 +3,8 @@
   // One <video> plays the playlist in clips.js. One off-document warmer preloads the
   // next file and is aborted (src cleared, load()) before it is reused. Listeners,
   // timers, and leaf nodes are created once. A stuck or broken clip is skipped.
+  // The visible video is muted before every play() so autoplay is allowed. canplay,
+  // visibility, and a watchdog start it again if a TV browser leaves it paused.
   const params = new URLSearchParams(location.search);
 
   function num(key, fallback, min, max) {
@@ -25,6 +27,7 @@
   const LEAF_CAP = 12;
   const FAIL_LIMIT = 3;
   const FAILURE_BACKOFF_MS = 180000;
+  const WATCHDOG_MS = 3000;
   const HARD_EXTRA_MS = 15 * 60 * 1000;
   const HOUR_MS = 3600000;
 
@@ -46,13 +49,31 @@
 
   // The muted property has to be set in script. The HTML attribute alone is not
   // enough for some TV browsers, and audible autoplay is what they block.
-  vid.muted = true;
-  vid.defaultMuted = true;
-  vid.loop = false;
-  vid.playsInline = true;
-  vid.preload = 'auto';
-  try { vid.disablePictureInPicture = true; } catch (e) {}
   let wantSound = false;
+
+  function prepareVideo(el) {
+    el.muted = true;
+    el.defaultMuted = true;
+    el.setAttribute('muted', '');
+    el.playsInline = true;
+    el.setAttribute('playsinline', '');
+    el.setAttribute('webkit-playsinline', '');
+    el.autoplay = true;
+    el.setAttribute('autoplay', '');
+    el.preload = 'auto';
+    el.controls = false;
+    el.removeAttribute('controls');
+    // The playlist is the loop. Looping the element would swallow `ended`
+    // and the next clip would never start.
+    el.loop = false;
+    el.removeAttribute('loop');
+    try { el.disablePictureInPicture = true; } catch (e) {}
+    try { el.disableRemotePlayback = true; } catch (e) {}
+    el.setAttribute('disablepictureinpicture', '');
+    el.setAttribute('disableremoteplayback', '');
+  }
+
+  prepareVideo(vid);
 
   function readClips() {
     const list = window.CLIPS;
@@ -80,7 +101,6 @@
   let paused = false;
   let failures = 0;
   let failedGen = -1;
-  let retryGen = -1;
   let reloading = false;
   let releasing = false;
   let armed = false;
@@ -298,12 +318,11 @@
   function warmer() {
     if (preloader) return preloader;
     preloader = document.createElement('video');
-    preloader.muted = true;
-    preloader.defaultMuted = true;
-    preloader.playsInline = true;
-    preloader.preload = 'auto';
+    prepareVideo(preloader);
+    // The warmer only preloads. Autoplay would start a second decoder.
+    preloader.autoplay = false;
+    preloader.removeAttribute('autoplay');
     preloader.setAttribute('aria-hidden', 'true');
-    try { preloader.disablePictureInPicture = true; } catch (e) {}
     // Swallow preload errors. The playback element decides if a file is bad.
     preloader.addEventListener('error', () => {});
     return preloader;
@@ -342,34 +361,82 @@
     releasing = false;
   }
 
-  function playClip() {
+  function soundOff() {
+    wantSound = false;
+    vid.muted = true;
+    vid.defaultMuted = true;
+    vid.setAttribute('muted', '');
+    soundBtn.textContent = '\uD83D\uDD07';
+    soundBtn.setAttribute('aria-label', 'Turn sound on');
+  }
+
+  function nudge(el) {
+    if (!el || paused || reloading || releasing) return;
+    if (!(el.getAttribute('src') || el.currentSrc)) return;
+    // Audible autoplay is what TV browsers block. Mute again immediately before play().
+    el.muted = true;
+    el.defaultMuted = true;
+    el.setAttribute('muted', '');
+    el.controls = false;
     const gen = generation;
     let ret;
-    try { ret = vid.play(); } catch (e) { ret = Promise.reject(e); }
+    try { ret = el.play(); } catch (e) { ret = Promise.reject(e); }
     // Older TV browsers return undefined from play(). Calling .then on that throws.
     Promise.resolve(ret).then(() => {
-      if (gen !== generation) return;
+      if (el === vid && gen !== generation) return;
       if (paused) {
-        try { vid.pause(); } catch (e) {}
+        try { el.pause(); } catch (e) {}
         return;
       }
-      vid.classList.add('on');
-      lastGood = Date.now();
+      if (el.paused) return;
+      if (el === vid && wantSound) {
+        el.muted = false;
+        if (el.paused) {
+          soundOff();
+          nudge(el);
+          return;
+        }
+      }
+      if (el === vid) {
+        el.classList.add('on');
+        lastGood = Date.now();
+      }
     }).catch((err) => {
-      if (gen !== generation || paused || reloading) return;
+      if (el === vid && gen !== generation) return;
+      if (paused || reloading) return;
       if (err && err.name === 'AbortError') return;
-      // One muted retry per clip. Audible autoplay is what TV browsers reject.
-      if (retryGen !== gen) {
-        retryGen = gen;
-        vid.muted = true;
-        wantSound = false;
-        soundBtn.textContent = '\uD83D\uDD07';
-        soundBtn.setAttribute('aria-label', 'Turn sound on');
-        playClip();
-        return;
-      }
-      failClip('playback rejected');
+      if (el === vid) soundOff();
+      // canplay, visibility, and the watchdog try again. A clip that never
+      // starts is skipped by the stall timer. A load error skips right away.
     });
+  }
+
+  function playClip() {
+    nudge(vid);
+  }
+
+  function videoNeedsKick(el) {
+    if (!el || el.ended) return false;
+    if (el.paused) return true;
+    return el.readyState < 2;
+  }
+
+  function isShown(el) {
+    if (!el || !el.isConnected || document.hidden) return false;
+    if (el.getAttribute('aria-hidden') === 'true') return false;
+    const box = el.getBoundingClientRect();
+    return box.width > 0 && box.height > 0;
+  }
+
+  function kickVisible() {
+    const nodes = document.querySelectorAll('video');
+    for (let i = 0; i < nodes.length; i++) {
+      const el = nodes[i];
+      if (!isShown(el)) continue;
+      if (!(el.getAttribute('src') || el.currentSrc)) continue;
+      if (!videoNeedsKick(el)) continue;
+      nudge(el);
+    }
   }
 
   function safeReload(reason, nextIndex) {
@@ -456,7 +523,8 @@
     sawFrame = false;
     lastGood = Date.now();
     clipStarted = lastGood;
-    vid.muted = !wantSound;
+    prepareVideo(vid);
+    vid.muted = true;
     vid.src = src;
     preloadNext();
     publish();
@@ -514,6 +582,19 @@
     if (!armed || releasing || reloading || paused || document.hidden) return;
     if ((vid.getAttribute('src') || '') !== expectedSrc) return;
     if (Date.now() - lastGood >= stallMs) failClip('stalled');
+    else nudge(vid);
+  }
+
+  function onCanPlay() {
+    if (document.hidden || paused || reloading || releasing) return;
+    if ((vid.getAttribute('src') || '') !== expectedSrc) return;
+    if (vid.paused) nudge(vid);
+  }
+
+  function onWaiting() {
+    if (!armed || releasing || reloading || paused || document.hidden) return;
+    if ((vid.getAttribute('src') || '') !== expectedSrc) return;
+    if (vid.paused || vid.readyState < 2) nudge(vid);
   }
 
   function onPlaying() {
@@ -548,6 +629,8 @@
   vid.addEventListener('abort', onAbort);
   vid.addEventListener('emptied', onEmptied);
   vid.addEventListener('stalled', onStalled);
+  vid.addEventListener('waiting', onWaiting);
+  vid.addEventListener('canplay', onCanPlay);
   vid.addEventListener('playing', onPlaying);
   vid.addEventListener('timeupdate', onTime);
 
@@ -569,6 +652,9 @@
   function toggleSound() {
     wantSound = !wantSound;
     vid.muted = !wantSound;
+    vid.defaultMuted = vid.muted;
+    if (vid.muted) vid.setAttribute('muted', '');
+    else vid.removeAttribute('muted');
     soundBtn.textContent = vid.muted ? '\uD83D\uDD07' : '\uD83D\uDD0A';
     soundBtn.setAttribute('aria-label', vid.muted ? 'Turn sound on' : 'Turn sound off');
     if (wantSound && !paused && clips.length) playClip();
@@ -690,7 +776,12 @@
     startLeaves();
     wake();
     paintCountdown();
-    if (!paused && expectedSrc && vid.paused && !reloading) playClip();
+    if (!paused && !reloading) kickVisible();
+  }
+
+  function watchdog() {
+    if (document.hidden || paused || reloading || releasing) return;
+    kickVisible();
   }
 
   function tick() {
@@ -774,6 +865,7 @@
   wake();
   document.addEventListener('visibilitychange', onVisible);
   setInterval(tick, 500);
+  setInterval(watchdog, WATCHDOG_MS);
 
   if (!clips.length) showEmpty();
   else show(startIndex());

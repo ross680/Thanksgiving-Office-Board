@@ -3,7 +3,15 @@
 html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#000;color-scheme:dark}
 body{font-family:Arial,Helvetica,sans-serif;color:var(--cream)}
 #stage{position:fixed;inset:0;cursor:none;background:#000}
-#vid{position:absolute;inset:0;z-index:2;width:100%;height:100%;object-fit:contain;background:#000;user-select:none;-webkit-user-drag:none}
+#vid{position:absolute;inset:0;z-index:2;width:100%;height:100%;object-fit:contain;background:#000;user-select:none;-webkit-user-drag:none;pointer-events:none}
+video::-webkit-media-controls,
+video::-webkit-media-controls-enclosure,
+video::-webkit-media-controls-panel,
+video::-webkit-media-controls-play-button,
+video::-webkit-media-controls-start-playback-button,
+video::-webkit-media-controls-overlay-play-button,
+::-webkit-media-controls-start-playback-button,
+::-webkit-media-controls-overlay-play-button{display:none !important;-webkit-appearance:none;opacity:0 !important;visibility:hidden !important;pointer-events:none !important}
 #fx{display:none;position:absolute;inset:0;z-index:3;pointer-events:none;overflow:hidden}
 .leaf{position:absolute;top:0;left:0;display:block;border-radius:2px 80% 2px 80%;pointer-events:none}
 #fade{display:none}
