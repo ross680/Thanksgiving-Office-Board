@@ -1,10 +1,12 @@
 (() => {
   // Office TV board, meant to sit on a screen for weeks.
-  // One <video> plays the playlist in clips.js. One off-document warmer preloads the
-  // next file and is aborted (src cleared, load()) before it is reused. Listeners,
-  // timers, and leaf nodes are created once. A stuck or broken clip is skipped.
-  // The visible video is muted before every play() so autoplay is allowed. canplay,
-  // visibility, and a watchdog start it again if a TV browser leaves it paused.
+  // Two stacked <video> elements. The hidden one preloads the next file and is
+  // already playing before it is shown, so the visible one is never left ended
+  // or paused between clips. src and load() are only used on the hidden element.
+  // Listeners, timers, and leaf nodes are created once. A stuck or broken clip
+  // is skipped. The visible video is muted before every play() so autoplay is
+  // allowed. canplay, visibility, and a watchdog start it again if a TV browser
+  // leaves it paused.
   const params = new URLSearchParams(location.search);
 
   function num(key, fallback, min, max) {
@@ -28,11 +30,12 @@
   const FAIL_LIMIT = 3;
   const FAILURE_BACKOFF_MS = 180000;
   const WATCHDOG_MS = 3000;
+  const HANDOFF_SEC = 0.3;
   const HARD_EXTRA_MS = 15 * 60 * 1000;
   const HOUR_MS = 3600000;
 
   const stage = document.getElementById('stage');
-  const vid = document.getElementById('vid');
+  const bufs = [document.getElementById('vidA'), document.getElementById('vidB')];
   const bar = document.querySelector('#progress span');
   const counter = document.getElementById('counter');
   const countdown = document.getElementById('countdown');
@@ -73,7 +76,43 @@
     el.setAttribute('disableremoteplayback', '');
   }
 
-  prepareVideo(vid);
+  prepareVideo(bufs[0]);
+  prepareVideo(bufs[1]);
+
+  function shownEl() {
+    if (bufs[0].classList.contains('show')) return bufs[0];
+    if (bufs[1].classList.contains('show')) return bufs[1];
+    return null;
+  }
+
+  function otherEl(el) {
+    return el === bufs[0] ? bufs[1] : bufs[0];
+  }
+
+  function hiddenEl() {
+    const vis = shownEl();
+    if (!vis) return bufs[0].error && !bufs[1].error ? bufs[1] : bufs[0];
+    return otherEl(vis);
+  }
+
+  function attrSrc(el) {
+    return (el && el.getAttribute('src')) || '';
+  }
+
+  function remaining(el) {
+    if (!el) return Infinity;
+    const dur = el.duration;
+    if (!dur || !isFinite(dur)) return Infinity;
+    return dur - el.currentTime;
+  }
+
+  // True once the visible clip is close enough that the hidden one should start.
+  function handoffDue() {
+    const vis = shownEl();
+    if (!vis) return false;
+    if (vis.ended) return true;
+    return remaining(vis) <= HANDOFF_SEC;
+  }
 
   function readClips() {
     const list = window.CLIPS;
@@ -111,8 +150,8 @@
   let clipStarted = 0;
   let wakeLock = null;
   let lastWake = 0;
-  let preloader = null;
   let preloaded = '';
+  const skipped = {};
   let armTimer = 0;
   let failTimer = 0;
   let idleTimer = 0;
@@ -315,64 +354,137 @@
     };
   }
 
-  function warmer() {
-    if (preloader) return preloader;
-    preloader = document.createElement('video');
-    prepareVideo(preloader);
-    // The warmer only preloads. Autoplay would start a second decoder.
-    preloader.autoplay = false;
-    preloader.removeAttribute('autoplay');
-    preloader.setAttribute('aria-hidden', 'true');
-    // Swallow preload errors. The playback element decides if a file is bad.
-    preloader.addEventListener('error', () => {});
-    return preloader;
+  // src and load() stay on the element that is not showing. The visible one
+  // is only revealed after the next file is already playing.
+  function releaseHidden(el) {
+    if (!el || el.classList.contains('show')) return;
+    releasing = true;
+    try { el.pause(); } catch (e) {}
+    el.removeAttribute('src');
+    el.src = '';
+    try { el.load(); } catch (e) {}
+    releasing = false;
   }
 
-  function abortPreload() {
-    preloaded = '';
-    if (!preloader) return;
-    try { preloader.pause(); } catch (e) {}
-    preloader.removeAttribute('src');
-    preloader.src = '';
-    try { preloader.load(); } catch (e) {}
+  function mount(el, src) {
+    if (!el || el.classList.contains('show') || !src) return false;
+    if (attrSrc(el) === src && !el.error) return true;
+    releaseHidden(el);
+    prepareVideo(el);
+    // Autoplay would start the hidden clip immediately. It should only buffer
+    // until the visible clip is about to end.
+    el.autoplay = false;
+    el.removeAttribute('autoplay');
+    el.muted = true;
+    el.defaultMuted = true;
+    el.src = src;
+    try { el.pause(); } catch (e) {}
+    return attrSrc(el) === src;
   }
 
-  function preloadNext() {
+  function upcomingIndex() {
+    if (!clips.length) return 0;
+    for (let step = 1; step <= clips.length; step++) {
+      const i = (index + step) % clips.length;
+      if (!skipped[clips[i]]) return i;
+    }
+    return (index + 1) % clips.length;
+  }
+
+  function reveal(el) {
+    if (!el) return;
+    const prev = shownEl();
+    if (prev && prev !== el) prev.classList.remove('show');
+    el.classList.add('show');
+    if (wantSound) {
+      el.muted = false;
+      if (el.paused) {
+        el.muted = true;
+        soundOff();
+      }
+    }
+    lastGood = Date.now();
+    clipStarted = lastGood;
+    lastMediaTime = el.currentTime || 0;
+    if (el.videoWidth > 0) sawFrame = true;
+  }
+
+  function preloadUpcoming() {
     if (clips.length < 2) {
-      abortPreload();
+      preloaded = '';
       return;
     }
-    const next = clips[(index + 1) % clips.length];
-    if (!next || next === preloaded) return;
-    abortPreload();
-    preloaded = next;
-    warmer().src = next;
+    const vis = shownEl();
+    if (!vis) return;
+    const back = otherEl(vis);
+    const nextSrc = clips[upcomingIndex()];
+    if (back.classList.contains('show')) return;
+    if (attrSrc(back) === nextSrc && !back.error) {
+      preloaded = nextSrc;
+      return;
+    }
+    if (mount(back, nextSrc)) preloaded = nextSrc;
   }
 
-  function releaseVideo() {
-    releasing = true;
-    armed = false;
-    abortPreload();
-    expectedSrc = '';
-    try { vid.pause(); } catch (e) {}
-    vid.classList.remove('on');
-    vid.removeAttribute('src');
-    try { vid.load(); } catch (e) {}
-    releasing = false;
+  function commitAdvance(el) {
+    const next = upcomingIndex();
+    if (!clips.length || attrSrc(el) !== clips[next]) {
+      if (attrSrc(el) === expectedSrc) reveal(el);
+      return;
+    }
+    index = next;
+    expectedSrc = clips[index];
+    failures = 0;
+    failedGen = -1;
+    counter.textContent = (index + 1) + ' / ' + clips.length;
+    bar.style.width = '0%';
+    sawFrame = false;
+    armed = true;
+    reveal(el);
+    publish();
+    preloadUpcoming();
+  }
+
+  function considerSwap(el) {
+    if (!el || paused || reloading || el.paused || el.ended) return;
+    const src = attrSrc(el);
+    const vis = shownEl();
+    if (!vis) {
+      if (src && src === expectedSrc) {
+        reveal(el);
+        publish();
+        preloadUpcoming();
+      } else if (clips.length && src === clips[upcomingIndex()]) {
+        commitAdvance(el);
+      }
+      return;
+    }
+    if (el === vis) return;
+    if (src === expectedSrc) {
+      reveal(el);
+      publish();
+      preloadUpcoming();
+      return;
+    }
+    if (src === clips[upcomingIndex()] && (vis.ended || remaining(vis) <= HANDOFF_SEC)) {
+      commitAdvance(el);
+    }
   }
 
   function soundOff() {
     wantSound = false;
-    vid.muted = true;
-    vid.defaultMuted = true;
-    vid.setAttribute('muted', '');
+    for (let i = 0; i < bufs.length; i++) {
+      bufs[i].muted = true;
+      bufs[i].defaultMuted = true;
+      bufs[i].setAttribute('muted', '');
+    }
     soundBtn.textContent = '\uD83D\uDD07';
     soundBtn.setAttribute('aria-label', 'Turn sound on');
   }
 
   function nudge(el) {
     if (!el || paused || reloading || releasing) return;
-    if (!(el.getAttribute('src') || el.currentSrc)) return;
+    if (!attrSrc(el)) return;
     // Audible autoplay is what TV browsers block. Mute again immediately before play().
     el.muted = true;
     el.defaultMuted = true;
@@ -383,13 +495,13 @@
     try { ret = el.play(); } catch (e) { ret = Promise.reject(e); }
     // Older TV browsers return undefined from play(). Calling .then on that throws.
     Promise.resolve(ret).then(() => {
-      if (el === vid && gen !== generation) return;
+      if (gen !== generation) return;
       if (paused) {
         try { el.pause(); } catch (e) {}
         return;
       }
       if (el.paused) return;
-      if (el === vid && wantSound) {
+      if (el.classList.contains('show') && wantSound) {
         el.muted = false;
         if (el.paused) {
           soundOff();
@@ -397,22 +509,70 @@
           return;
         }
       }
-      if (el === vid) {
-        el.classList.add('on');
-        lastGood = Date.now();
-      }
+      if (el.classList.contains('show')) lastGood = Date.now();
+      considerSwap(el);
     }).catch((err) => {
-      if (el === vid && gen !== generation) return;
-      if (paused || reloading) return;
+      if (gen !== generation || paused || reloading) return;
       if (err && err.name === 'AbortError') return;
-      if (el === vid) soundOff();
+      if (el.classList.contains('show')) soundOff();
       // canplay, visibility, and the watchdog try again. A clip that never
       // starts is skipped by the stall timer. A load error skips right away.
     });
   }
 
   function playClip() {
-    nudge(vid);
+    const el = shownEl();
+    if (el && attrSrc(el) === expectedSrc) nudge(el);
+  }
+
+  function startIncoming() {
+    if (paused || reloading || releasing || !clips.length) return;
+    const vis = shownEl();
+    if (!vis) {
+      const follow = clips.length > 1 ? clips[upcomingIndex()] : expectedSrc;
+      for (let i = 0; i < bufs.length; i++) {
+        const el = bufs[i];
+        if (el.ended) continue;
+        const src = attrSrc(el);
+        if (src !== expectedSrc && src !== follow) continue;
+        if (el.paused) nudge(el);
+        else considerSwap(el);
+        return;
+      }
+      return;
+    }
+    if (!handoffDue() || clips.length < 2) return;
+    const back = otherEl(vis);
+    if (!back || back.classList.contains('show')) return;
+    const nextSrc = clips[upcomingIndex()];
+    if (attrSrc(back) !== nextSrc || back.error) {
+      if (!mount(back, nextSrc)) return;
+      preloaded = nextSrc;
+    }
+    if (!back.paused && !back.ended) {
+      considerSwap(back);
+      return;
+    }
+    nudge(back);
+  }
+
+  function hideIfEnded(el) {
+    if (!el || !el.classList.contains('show')) return;
+    if (!el.ended && remaining(el) > 0) return;
+    const back = otherEl(el);
+    const nextSrc = clips.length ? clips[upcomingIndex()] : '';
+    if (nextSrc && attrSrc(back) === nextSrc && !back.paused && !back.ended) {
+      commitAdvance(back);
+      return;
+    }
+    // The ended frame is gone before the TV can paint a play button on it.
+    el.classList.remove('show');
+    if (!nextSrc) return;
+    if (attrSrc(back) !== nextSrc || back.error) {
+      if (!mount(back, nextSrc)) return;
+      preloaded = nextSrc;
+    }
+    nudge(back);
   }
 
   function videoNeedsKick(el) {
@@ -423,7 +583,9 @@
 
   function isShown(el) {
     if (!el || !el.isConnected || document.hidden) return false;
-    if (el.getAttribute('aria-hidden') === 'true') return false;
+    if (!el.classList.contains('show')) return false;
+    const style = getComputedStyle(el);
+    if (style.visibility === 'hidden' || style.display === 'none' || Number(style.opacity) === 0) return false;
     const box = el.getBoundingClientRect();
     return box.width > 0 && box.height > 0;
   }
@@ -433,7 +595,7 @@
     for (let i = 0; i < nodes.length; i++) {
       const el = nodes[i];
       if (!isShown(el)) continue;
-      if (!(el.getAttribute('src') || el.currentSrc)) continue;
+      if (!attrSrc(el)) continue;
       if (!videoNeedsKick(el)) continue;
       nudge(el);
     }
@@ -513,7 +675,7 @@
     if (reloading) return;
     const gen = ++generation;
     armed = false;
-    releaseVideo();
+    stage.classList.remove('empty');
     index = ((n % clips.length) + clips.length) % clips.length;
     const src = clips[index];
     expectedSrc = src;
@@ -523,10 +685,24 @@
     sawFrame = false;
     lastGood = Date.now();
     clipStarted = lastGood;
-    prepareVideo(vid);
-    vid.muted = true;
-    vid.src = src;
-    preloadNext();
+    const vis = shownEl();
+    if (vis && attrSrc(vis) === src && !vis.error) {
+      publish();
+      if (armTimer) clearTimeout(armTimer);
+      armTimer = setTimeout(() => {
+        armTimer = 0;
+        if (generation === gen) armed = true;
+      }, 0);
+      if (!paused) nudge(vis);
+      preloadUpcoming();
+      return;
+    }
+    let el = null;
+    for (let i = 0; i < bufs.length; i++) {
+      if (!bufs[i].classList.contains('show') && attrSrc(bufs[i]) === src && !bufs[i].error) el = bufs[i];
+    }
+    if (!el) el = hiddenEl();
+    if (!mount(el, src)) return;
     publish();
     if (armTimer) clearTimeout(armTimer);
     armTimer = setTimeout(() => {
@@ -534,30 +710,65 @@
       if (generation === gen) armed = true;
     }, 0);
     if (paused) return;
-    playClip();
+    nudge(el);
   }
 
   function showEmpty() {
-    releaseVideo();
+    const vis = shownEl();
+    if (vis) vis.classList.remove('show');
+    releaseHidden(bufs[0]);
+    releaseHidden(bufs[1]);
+    expectedSrc = '';
+    preloaded = '';
     counter.textContent = window.CLIPS ? 'No clips yet' : 'Playlist missing';
     stage.classList.add('empty');
     bar.style.width = '0%';
     publish();
   }
 
-  function onEnded() {
+  function onEnded(e) {
+    const el = e.target;
+    if (!el.classList.contains('show')) return;
     if (!armed || reloading || releasing || swapGrace()) return;
-    if ((vid.getAttribute('src') || '') !== expectedSrc) return;
+    if (attrSrc(el) !== expectedSrc) return;
     failures = 0;
     failedGen = -1;
     lastGood = Date.now();
-    advance(false);
+    hideIfEnded(el);
   }
 
-  function onError() {
+  function skipHidden(el) {
+    if (!el || el.classList.contains('show')) return;
+    const src = attrSrc(el);
+    if (!src) return;
+    let at = -1;
+    for (let i = 0; i < clips.length; i++) {
+      if (clips[i] === src) { at = i; break; }
+    }
+    if (at < 0) return;
+    skipped[src] = true;
+    note('preload error');
+    failures += 1;
+    if (failures >= FAIL_LIMIT && !offline) {
+      safeReload('failures');
+      return;
+    }
+    if (failures >= FAIL_LIMIT && offline) failures = 0;
+    const nxt = upcomingIndex();
+    if (nxt === index || skipped[clips[nxt]]) return;
+    if (mount(el, clips[nxt])) preloaded = clips[nxt];
+    if (!paused && (!shownEl() || handoffDue())) nudge(el);
+  }
+
+  function onError(e) {
+    const el = e.target;
     if (releasing || reloading) return;
-    const current = vid.getAttribute('src') || '';
-    if (!current || current !== expectedSrc) return;
+    if (!el.classList.contains('show')) {
+      skipHidden(el);
+      return;
+    }
+    if (!attrSrc(el) || attrSrc(el) !== expectedSrc) return;
+    el.classList.remove('show');
     failClip('error');
   }
 
@@ -566,51 +777,74 @@
     return clipStarted > 0 && Date.now() - clipStarted < 400;
   }
 
-  function onAbort() {
+  function onAbort(e) {
+    const el = e.target;
+    if (!el.classList.contains('show')) return;
     if (!armed || releasing || reloading || paused || swapGrace()) return;
-    if ((vid.getAttribute('src') || '') !== expectedSrc) return;
+    if (attrSrc(el) !== expectedSrc) return;
     failClip('abort');
   }
 
-  function onEmptied() {
+  function onEmptied(e) {
+    const el = e.target;
+    if (!el.classList.contains('show')) return;
     if (!armed || releasing || reloading || paused || swapGrace()) return;
-    if ((vid.getAttribute('src') || '') !== expectedSrc) return;
+    if (attrSrc(el) !== expectedSrc) return;
     failClip('emptied');
   }
 
-  function onStalled() {
+  function onStalled(e) {
+    const el = e.target;
+    if (!el.classList.contains('show')) return;
     if (!armed || releasing || reloading || paused || document.hidden) return;
-    if ((vid.getAttribute('src') || '') !== expectedSrc) return;
+    if (attrSrc(el) !== expectedSrc) return;
     if (Date.now() - lastGood >= stallMs) failClip('stalled');
-    else nudge(vid);
+    else nudge(el);
   }
 
-  function onCanPlay() {
+  function onCanPlay(e) {
+    const el = e.target;
     if (document.hidden || paused || reloading || releasing) return;
-    if ((vid.getAttribute('src') || '') !== expectedSrc) return;
-    if (vid.paused) nudge(vid);
+    if (el.classList.contains('show')) {
+      if (attrSrc(el) === expectedSrc && el.paused && !el.ended) nudge(el);
+      return;
+    }
+    const src = attrSrc(el);
+    if (!shownEl() && src === expectedSrc) {
+      nudge(el);
+      return;
+    }
+    if (handoffDue() && clips.length && src === clips[upcomingIndex()]) nudge(el);
   }
 
-  function onWaiting() {
+  function onWaiting(e) {
+    const el = e.target;
+    if (!el.classList.contains('show')) return;
     if (!armed || releasing || reloading || paused || document.hidden) return;
-    if ((vid.getAttribute('src') || '') !== expectedSrc) return;
-    if (vid.paused || vid.readyState < 2) nudge(vid);
+    if (attrSrc(el) !== expectedSrc) return;
+    if (el.paused || el.readyState < 2) nudge(el);
   }
 
-  function onPlaying() {
-    if ((vid.getAttribute('src') || '') !== expectedSrc) return;
-    vid.classList.add('on');
-    lastGood = Date.now();
-  }
-
-  function onTime() {
-    if ((vid.getAttribute('src') || '') !== expectedSrc) return;
-    // A last timeupdate from a file that already failed must not cancel the skip.
-    if (vid.error) return;
-    if (vid.currentTime > lastMediaTime + 0.2) {
-      lastMediaTime = vid.currentTime;
+  function onPlaying(e) {
+    const el = e.target;
+    if (reloading || releasing || paused) return;
+    if (el.classList.contains('show')) {
+      if (attrSrc(el) !== expectedSrc) return;
       lastGood = Date.now();
-      if (vid.videoWidth > 0) {
+      return;
+    }
+    considerSwap(el);
+  }
+
+  function onTime(e) {
+    const el = e.target;
+    if (!el.classList.contains('show')) return;
+    if (attrSrc(el) !== expectedSrc) return;
+    if (el.error) return;
+    if (el.currentTime > lastMediaTime + 0.2) {
+      lastMediaTime = el.currentTime;
+      lastGood = Date.now();
+      if (el.videoWidth > 0) {
         sawFrame = true;
         failures = 0;
         failedGen = -1;
@@ -618,21 +852,26 @@
           clearTimeout(failTimer);
           failTimer = 0;
         }
-      } else if (vid.currentTime > 1) {
+      } else if (el.currentTime > 1) {
         failClip('no frames');
       }
     }
+    if (remaining(el) <= HANDOFF_SEC) startIncoming();
+    if (el.ended) hideIfEnded(el);
   }
 
-  vid.addEventListener('ended', onEnded);
-  vid.addEventListener('error', onError);
-  vid.addEventListener('abort', onAbort);
-  vid.addEventListener('emptied', onEmptied);
-  vid.addEventListener('stalled', onStalled);
-  vid.addEventListener('waiting', onWaiting);
-  vid.addEventListener('canplay', onCanPlay);
-  vid.addEventListener('playing', onPlaying);
-  vid.addEventListener('timeupdate', onTime);
+  for (let b = 0; b < bufs.length; b++) {
+    bufs[b].addEventListener('ended', onEnded);
+    bufs[b].addEventListener('error', onError);
+    bufs[b].addEventListener('abort', onAbort);
+    bufs[b].addEventListener('emptied', onEmptied);
+    bufs[b].addEventListener('stalled', onStalled);
+    bufs[b].addEventListener('waiting', onWaiting);
+    bufs[b].addEventListener('canplay', onCanPlay);
+    bufs[b].addEventListener('playing', onPlaying);
+    bufs[b].addEventListener('timeupdate', onTime);
+  }
+
 
   function togglePause() {
     paused = !paused;
@@ -641,23 +880,30 @@
     publish();
     if (!clips.length) return;
     if (paused) {
-      try { vid.pause(); } catch (e) {}
+      for (let i = 0; i < bufs.length; i++) {
+        try { bufs[i].pause(); } catch (e) {}
+      }
       if (reloadAt && clock() >= reloadAt) safeReload('scheduled');
       return;
     }
     lastGood = Date.now();
     playClip();
+    if (handoffDue()) startIncoming();
   }
 
   function toggleSound() {
     wantSound = !wantSound;
-    vid.muted = !wantSound;
-    vid.defaultMuted = vid.muted;
-    if (vid.muted) vid.setAttribute('muted', '');
-    else vid.removeAttribute('muted');
-    soundBtn.textContent = vid.muted ? '\uD83D\uDD07' : '\uD83D\uDD0A';
-    soundBtn.setAttribute('aria-label', vid.muted ? 'Turn sound on' : 'Turn sound off');
-    if (wantSound && !paused && clips.length) playClip();
+    const el = shownEl();
+    if (el) {
+      el.muted = !wantSound;
+      el.defaultMuted = el.muted;
+      if (el.muted) el.setAttribute('muted', '');
+      else el.removeAttribute('muted');
+    }
+    const mutedNow = !el || el.muted;
+    soundBtn.textContent = mutedNow ? '\uD83D\uDD07' : '\uD83D\uDD0A';
+    soundBtn.setAttribute('aria-label', mutedNow ? 'Turn sound on' : 'Turn sound off');
+    if (wantSound && !paused && clips.length && el) nudge(el);
   }
 
   document.getElementById('next').onclick = () => advance(true);
@@ -798,13 +1044,21 @@
     if (paused || !clips.length || document.hidden) {
       lastGood = now;
     } else if (expectedSrc) {
-      const duration = vid.duration;
-      if (duration && isFinite(duration) && duration > 0) {
-        bar.style.width = Math.min(100, (100 * vid.currentTime) / duration) + '%';
+      const el = shownEl();
+      if (!el) {
+        startIncoming();
+        if (now - lastGood >= stallMs) failClip('stalled');
+      } else {
+        const duration = el.duration;
+        if (duration && isFinite(duration) && duration > 0) {
+          bar.style.width = Math.min(100, (100 * el.currentTime) / duration) + '%';
+        }
+        if (remaining(el) <= HANDOFF_SEC) startIncoming();
+        if (el.ended) hideIfEnded(el);
+        else if (!sawFrame && el.currentTime > 1 && el.videoWidth === 0) failClip('no frames');
+        else if (now - lastGood >= stallMs) failClip('stalled');
+        else if (clipStarted && now - clipStarted >= maxClip * 1000) advance(false);
       }
-      if (!sawFrame && vid.currentTime > 1 && vid.videoWidth === 0) failClip('no frames');
-      else if (now - lastGood >= stallMs) failClip('stalled');
-      else if (clipStarted && now - clipStarted >= maxClip * 1000) advance(false);
     }
     if (now - lastWake >= 60000) {
       lastWake = now;
@@ -821,8 +1075,9 @@
     offline = false;
     publish();
     if (Date.now() - booted < 5000 || paused || !clips.length || reloading) return;
-    if (vid.error || vid.networkState === 3) show(index);
-    else if (expectedSrc && vid.paused) playClip();
+    const el = shownEl();
+    if (!el || el.error || el.networkState === 3) show(index);
+    else if (expectedSrc && el.paused) nudge(el);
   });
 
   window.onerror = (msg) => { note('error: ' + msg); };
