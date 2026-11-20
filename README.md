@@ -24,7 +24,7 @@ Pages can take a minute after the push. The TV may keep the previous `index.html
 
 Right arrow or Space: next · Left arrow: previous · P: pause · M: sound on/off · F: fullscreen
 
-Clips start muted so Chrome and TV browsers allow autoplay. M, or the sound button, turns sound on. The clips in this set are silent. The video is muted, inline (`playsinline` and `webkit-playsinline`), and set to autoplay, with no `controls` attribute. Picture-in-picture and remote playback are off. A black poster shows while a clip loads. Native play overlays are hidden in CSS. The playlist is what loops: the element itself is not looped, so `ended` can start the next clip.
+Clips start muted so Chrome and TV browsers allow autoplay. M, or the sound button, turns sound on. The clips in this set are silent. Both videos are muted, inline (`playsinline` and `webkit-playsinline`), and set to autoplay, with no `controls` attribute. Picture-in-picture and remote playback are off. A black poster shows while a clip loads, and the stage behind the videos is black. Native play overlays are hidden in CSS, and the videos do not take pointer events. The playlist is what loops: neither element is looped, so the hidden clip can take over before the visible one ends.
 
 Move the pointer to see the controls and the clip count (`3 / 8`). The pointer hides again after a few seconds still. The Thanksgiving chip is a compact label in the top-right corner, clear of the headline block on the left of every clip. It does not animate and it does not move. It counts down to 12:00 AM America/New_York on Thursday, November 26, 2026, in Eastern time no matter which timezone the TV is set to. One interval ticks it in place for the life of the page, for example `28d 13h 21m 00s until Thanksgiving`. On November 26 it reads `Happy Thanksgiving from the 3R family`. After that it reads `THANK YOU FOR A GREAT YEAR` and stays on that line. It does not roll to next year. The scheduled reload opens a fresh page and the chip reads the clock again, so it does not drift. The picture sits on a plain black background. Falling leaves are off. `?leaves=1` turns them on.
 
@@ -54,11 +54,11 @@ Renaming a file does not change the order. The list does.
 
 When you replace a file and keep the same name, change the `?v=` text on that line (any new string). That is the cache buster, same idea as the Christmas board. Leave `?v=` alone when the bytes did not change, or the TV downloads the clip again for no reason. The `?v=` values shipped here are the first 10 characters of each file's SHA-256.
 
-`app.js` and `styles.css` are linked with `?v=20261120a`. Bump that text in `index.html` when you change those files so the TV does not keep an old copy. You do not need to touch it when you only edit `clips.js`.
+`app.js` and `styles.css` are linked with `?v=20261120b`. Bump that text in `index.html` when you change those files so the TV does not keep an old copy. You do not need to touch it when you only edit `clips.js`.
 
 ## Keeping the picture moving
 
-One `<video>` element in the page is reused. Each clip is detached (`pause`, clear `src`, `load()`) before the next one so the TV can free the decoder. The next file is warmed on a single off-screen video that is never added to the page. That warmer is aborted the same way (`src` cleared, then `load()`) before it takes another file, so preload elements do not pile up.
+Two stacked `<video>` elements share the screen. The one that is showing is left alone: its `src` is not changed and `load()` is not called on it. The hidden one preloads the next file (`muted`, inline, `preload=auto`). When under 0.3s remain, that hidden clip is started, then the two swap as soon as it is actually playing. The clip that just finished is already hidden, so the TV does not paint it ended or paused. After the swap the hidden element is released (`src` cleared, then `load()`) and the following file is preloaded into it.
 
 If `play()` is rejected, the board forces mute and tries again. It also calls `play()` on `canplay`, when the page becomes visible, and from a watchdog every 3 seconds if a visible clip is paused or stalled. A clip that errors, or never produces a picture, is skipped instead of sitting on a frame. Listeners and timers are registered once for the life of the page, not once per clip.
 
